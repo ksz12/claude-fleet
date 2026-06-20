@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""claude-dashboard — live view of fleet sessions + taskboard.
+
+Reads:
+  ~/.claude/fleet/sessions/*.json   (running / waiting)
+  ~/.claude/fleet/archive/*.json    (previous)
+  ~/.claude/fleet/tasks/tasks.json  (taskboard)
+
+Default: refreshes every 2s. Use --once for a single render.
+"""
+import json, os, sys, glob, time, argparse
+from datetime import datetime, timezone
+
+FLEET_DIR = os.environ.get("FLEET_DIR", os.path.expanduser("~/.claude/fleet"))
+SESS = os.path.join(FLEET_DIR, "sessions")
+ARCH = os.path.join(FLEET_DIR, "archive")
+TASKS = os.path.join(FLEET_DIR, "tasks", "tasks.json")
+
+C = {"reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+     "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
+     "cyan": "\033[36m", "blue": "\033[34m", "mag": "\033[35m"}
+
+STATUS_COLOR = {"working": "green", "active": "cyan", "starting": "blue",
+                "idle": "yellow", "stuck": "red", "crashed": "red",
+                "ended": "dim"}
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def ago(s):
+    t = parse_iso(s)
+    if not t:
+        return "-"
+    d = (datetime.now(timezone.utc) - t).total_seconds()
+    if d < 60:   return "%ds" % int(d)
+    if d < 3600: return "%dm" % int(d / 60)
+    if d < 86400: return "%dh%dm" % (int(d / 3600), int((d % 3600) / 60))
+    return "%dd" % int(d / 86400)
+
+
+def dur(s):
+    t = parse_iso(s)
+    if not t:
+        return "-"
+    d = (datetime.now(timezone.utc) - t).total_seconds()
+    if d < 3600: return "%dm" % int(d / 60)
+    return "%dh%dm" % (int(d / 3600), int((d % 3600) / 60))
+
+
+def load_dir(d):
+    out = []
+    for p in glob.glob(os.path.join(d, "*.json")):
+        try:
+            with open(p) as f:
+                out.append(json.load(f))
+        except Exception:
+            pass
+    return out
+
+
+def load_tasks():
+    try:
+        with open(TASKS) as f:
+            return json.load(f).get("tasks", [])
+    except Exception:
+        return []
+
+
+def col(text, name):
+    return C.get(name, "") + text + C["reset"]
+
+
+def render():
+    sessions = load_dir(SESS)
+    archive = sorted(load_dir(ARCH), key=lambda s: s.get("latest_activity", ""), reverse=True)
+    tasks = load_tasks()
+    sessions.sort(key=lambda s: s.get("started_at", ""))
+
+    lines = []
+    hdr = " CLAUDE FLEET DASHBOARD  ·  %s " % datetime.now().strftime("%H:%M:%S")
+    lines.append(col(C["bold"] + hdr, "cyan"))
+    lines.append("")
+
+    # RUNNING
+    lines.append(col("RUNNING", "bold"))
+    if not sessions:
+        lines.append(col("  (none)", "dim"))
+    else:
+        lines.append(col("  %-22s %-9s %-7s %-7s %-7s %s" %
+                         ("NAME", "STATUS", "TASK", "UPTIME", "ACTIVE", "DIR"), "dim"))
+        for s in sessions:
+            st = s.get("status", "?")
+            lines.append("  %-22s %s %-7s %-7s %-7s %s" % (
+                s.get("name", "?")[:22],
+                col("%-9s" % st, STATUS_COLOR.get(st, "reset")),
+                (s.get("current_task") or "-")[:7],
+                dur(s.get("started_at")),
+                ago(s.get("latest_activity")),
+                col(s.get("dir_label") or os.path.basename(s.get("working_directory", "") or "-"), "dim"),
+            ))
+
+    # WAITING (idle = finished responding, awaiting input)
+    waiting = [s for s in sessions if s.get("status") == "idle"]
+    lines.append("")
+    lines.append(col("WAITING ON YOU", "bold"))
+    if not waiting:
+        lines.append(col("  (none)", "dim"))
+    else:
+        for s in waiting:
+            lines.append("  %s %s %s" % (
+                col("%-22s" % s.get("name", "?")[:22], "yellow"),
+                col("%-9s" % "idle", STATUS_COLOR.get("idle", "yellow")),
+                col("%s ago" % ago(s.get("latest_activity")), "dim"),
+            ))
+
+    # TASKBOARD
+    lines.append("")
+    lines.append(col("TASKBOARD", "bold"))
+    open_t = [t for t in tasks if t.get("status") != "done"]
+    if not open_t:
+        lines.append(col("  (no open tasks)", "dim"))
+    else:
+        for t in open_t:
+            mark = {"open": "[ ]", "claimed": "[~]"}.get(t.get("status"), "[?]")
+            who = t.get("claimed_by") or t.get("session") or "-"
+            lines.append("  %s %-7s %s %s" % (
+                mark, t.get("id"),
+                col("%-14s" % who[:14], "mag"),
+                t.get("text", "")[:60]))
+
+    # PREVIOUS
+    lines.append("")
+    lines.append(col("PREVIOUS", "bold"))
+    if not archive:
+        lines.append(col("  (none)", "dim"))
+    else:
+        for s in archive[:8]:
+            st = s.get("status", "ended")
+            verb = st or "ended"
+            lines.append("  %s %s" % (
+                col("%-22s" % s.get("name", "?")[:22], "dim"),
+                col("%s %s ago" % (verb, ago(s.get("latest_activity"))), STATUS_COLOR.get(st, "dim")),
+            ))
+
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--interval", type=float, default=2.0)
+    a = ap.parse_args()
+    if a.once:
+        print(render()); return
+    try:
+        while True:
+            sys.stdout.write("\033[2J\033[H")  # clear + home
+            sys.stdout.write(render() + "\n")
+            sys.stdout.flush()
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

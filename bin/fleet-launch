@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# fleet-launch --name NAME --repo DIR --prompt-file FILE [--task t-001]
+#
+# Mechanical, reliable launch of one interactive Claude session in tmux.
+# Called by the /background skill after it has done the intelligent parts
+# (prompt expansion, naming, repo resolution, confirmation).
+#
+# Set FLEET_LAUNCH_DRYRUN=1 to print the plan without touching tmux (for tests).
+# Set FLEET_LAUNCH_CMD to override the launched command (test with e.g. "cat").
+
+set -u
+DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$DIR/fleet-lib.sh"
+fleet_ensure_dirs
+
+NAME=""; REPO=""; PROMPT_FILE=""; TASK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) NAME="$2"; shift 2 ;;
+    --repo) REPO="$2"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
+    --task) TASK="$2"; shift 2 ;;
+    *) echo "fleet-launch: unknown arg: $1" >&2; shift ;;
+  esac
+done
+
+[ -z "$NAME" ] && { echo "fleet-launch: --name required" >&2; exit 1; }
+[ -z "$REPO" ] && { echo "fleet-launch: --repo required" >&2; exit 1; }
+[ -z "$PROMPT_FILE" ] && { echo "fleet-launch: --prompt-file required" >&2; exit 1; }
+[ ! -f "$PROMPT_FILE" ] && { echo "fleet-launch: prompt file not found: $PROMPT_FILE" >&2; exit 1; }
+
+mkdir -p "$REPO"
+REPO="$(cd "$REPO" && pwd)"
+REPO_ROOT="$(fleet_repo_root "$REPO")"
+PROMPT="$(cat "$PROMPT_FILE")"
+NOW="$(fleet_now)"
+CLAUDE_BIN="${FLEET_LAUNCH_CMD:-$(command -v claude 2>/dev/null || echo claude)}"
+
+# --- register session state (status starts as "starting") ---
+f="$SESS_DIR/$NAME.json"
+jq -n --arg name "$NAME" --arg prompt "$PROMPT" --arg sa "$NOW" \
+      --arg wd "$REPO" --arg rr "$REPO_ROOT" --arg task "$TASK" \
+  '{name:$name,prompt:$prompt,started_at:$sa,status:"starting",working_directory:$wd,repo_root:$rr,claude_conversation_id:"",transcript_path:"",current_task:$task,latest_activity:$sa,tmux_session:$name}' \
+  > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+
+# --- index: cwd -> name (correlation fallback) ---
+[ -f "$INDEX" ] || echo '{}' > "$INDEX"
+jq --arg c "$REPO" --arg n "$NAME" '.[$c]=$n' "$INDEX" > "$INDEX.tmp.$$" && mv "$INDEX.tmp.$$" "$INDEX"
+
+if [ "${FLEET_LAUNCH_DRYRUN:-0}" = "1" ]; then
+  echo "[dry-run] would: tmux new-session -d -s $NAME -c $REPO"
+  echo "[dry-run] would launch: FLEET_SESSION_NAME=$NAME $CLAUDE_BIN --dangerously-skip-permissions"
+  echo "[dry-run] would paste prompt from: $PROMPT_FILE"
+  echo "[dry-run] registered: $f"
+  exit 0
+fi
+
+if tmux has-session -t "$NAME" 2>/dev/null; then
+  echo "fleet-launch: tmux session '$NAME' already exists" >&2; exit 1
+fi
+
+tmux new-session -d -s "$NAME" -c "$REPO"
+# ALWAYS cd to the repo, then launch claude interactively with name injection
+tmux send-keys -t "$NAME" "cd $(printf '%q' "$REPO") && FLEET_SESSION_NAME=$(printf '%q' "$NAME") $CLAUDE_BIN --dangerously-skip-permissions" Enter
+
+# --- wait for the input prompt; auto-accept the first-run folder-trust prompt ---
+# (--dangerously-skip-permissions does NOT bypass the "trust this folder" dialog;
+#  new repos always hit it. We accept it since the harness created the dir.)
+ready=0
+i=0
+trusted=0
+while [ $i -lt 120 ]; do
+  pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
+  case "$pane" in
+    *"trust this folder"*|*"Yes, I trust"*)
+      if [ "$trusted" -eq 0 ]; then
+        tmux send-keys -t "$NAME" Enter   # selects default "1. Yes, I trust"
+        trusted=1
+      fi
+      i=$((i+1)); sleep 1; continue ;;
+  esac
+  # the real input prompt is up once the bypass-mode footer / welcome box renders
+  case "$pane" in
+    *"bypass permissions on"*|*"? for shortcuts"*|*"Welcome back"*) ready=1; break ;;
+  esac
+  i=$((i+1)); sleep 1
+done
+
+# brief extra settle so the prompt box is fully interactive before we paste
+if [ "$ready" -eq 1 ]; then sleep 2; fi
+
+# --- send the (multi-line) prompt: load-buffer + paste-buffer, NEVER send-keys ---
+buf="fleet-$NAME"
+tmux load-buffer -b "$buf" "$PROMPT_FILE"
+sleep 1
+tmux paste-buffer -p -b "$buf" -t "$NAME"
+sleep 1
+tmux send-keys -t "$NAME" Enter
+tmux delete-buffer -b "$buf" 2>/dev/null
+
+# --- pop the session into its own Terminal.app window (alt-tab target) ---
+# Always-on for interactive launches. Disable with FLEET_NO_WINDOW=1 (set in
+# headless/cron contexts). Best-effort: failure here never fails the launch.
+if [ "${FLEET_NO_WINDOW:-0}" != "1" ] && [ "$(uname)" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
+  osascript >/dev/null 2>&1 <<OSA &
+tell application "Terminal"
+  do script "tmux attach -t $NAME"
+  activate
+end tell
+OSA
+  echo "opened a new Terminal window attached to $NAME"
+fi
+
+if [ "$ready" -eq 1 ]; then
+  echo "launched: $NAME  ->  tmux attach -t $NAME   (prompt sent)"
+else
+  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: readiness not confirmed; verify the prompt landed)"
+fi

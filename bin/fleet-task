@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""fleet-task — taskboard CRUD for the Claude Fleet harness.
+
+Storage: ~/.claude/fleet/tasks/tasks.json  ->  {"seq": N, "tasks": [ ... ]}
+Each task: {id, text, repo, session, status, created_by, created_at,
+            claimed_by, claimed_at, completed_at}
+status: open | claimed | done
+
+Concurrency: fcntl.flock on tasks/.lock (macOS has no `flock` CLI but
+Python's fcntl works fine).
+
+Usage:
+  fleet-task add "text" [--repo R] [--session S] [--created-by S]
+  fleet-task list [--json] [--status open|claimed|done] [--repo R]
+  fleet-task get <id> [--json]
+  fleet-task claim <id> --session S
+  fleet-task complete <id>
+  fleet-task remove <id>
+  fleet-task clear [--done]            # clear done tasks, or all with --all
+"""
+import argparse, json, os, sys, fcntl, re
+from datetime import datetime, timezone
+
+FLEET_DIR = os.environ.get("FLEET_DIR", os.path.expanduser("~/.claude/fleet"))
+TASKS_DIR = os.path.join(FLEET_DIR, "tasks")
+TASKS_FILE = os.path.join(TASKS_DIR, "tasks.json")
+LOCK_FILE = os.path.join(TASKS_DIR, ".lock")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize(text):
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+class Board:
+    def __init__(self):
+        os.makedirs(TASKS_DIR, exist_ok=True)
+        self.lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+        if os.path.exists(TASKS_FILE):
+            with open(TASKS_FILE) as f:
+                self.data = json.load(f)
+        else:
+            self.data = {"seq": 0, "tasks": []}
+
+    def save(self):
+        tmp = TASKS_FILE + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2)
+        os.replace(tmp, TASKS_FILE)
+        fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        self.lock_fd.close()
+
+    def find(self, tid):
+        for t in self.data["tasks"]:
+            if t["id"] == tid:
+                return t
+        return None
+
+
+def cmd_add(b, a):
+    norm = normalize(a.text)
+    for t in b.data["tasks"]:
+        if t["status"] != "done" and normalize(t["text"]) == norm:
+            print("duplicate of %s (not added)" % t["id"])
+            return t["id"]
+    b.data["seq"] += 1
+    tid = "t-%03d" % b.data["seq"]
+    task = {
+        "id": tid, "text": a.text.strip(),
+        "repo": a.repo or "", "session": a.session or "",
+        "status": "open",
+        "created_by": a.created_by or a.session or "",
+        "created_at": now_iso(),
+        "claimed_by": "", "claimed_at": "", "completed_at": "",
+    }
+    b.data["tasks"].append(task)
+    print("added %s: %s" % (tid, task["text"]))
+    return tid
+
+
+def cmd_claim(b, a):
+    t = b.find(a.id)
+    if not t:
+        print("no such task: %s" % a.id, file=sys.stderr); sys.exit(1)
+    t["status"] = "claimed"; t["claimed_by"] = a.session; t["claimed_at"] = now_iso()
+    if a.session and not t["session"]:
+        t["session"] = a.session
+    print("%s claimed by %s" % (a.id, a.session))
+
+
+def cmd_complete(b, a):
+    t = b.find(a.id)
+    if not t:
+        print("no such task: %s" % a.id, file=sys.stderr); sys.exit(1)
+    t["status"] = "done"; t["completed_at"] = now_iso()
+    print("%s completed" % a.id)
+
+
+def cmd_remove(b, a):
+    n = len(b.data["tasks"])
+    b.data["tasks"] = [t for t in b.data["tasks"] if t["id"] != a.id]
+    print("removed %s" % a.id if len(b.data["tasks"]) < n else "no such task: %s" % a.id)
+
+
+def cmd_clear(b, a):
+    if a.all:
+        b.data["tasks"] = []
+        print("cleared all tasks")
+    else:
+        b.data["tasks"] = [t for t in b.data["tasks"] if t["status"] != "done"]
+        print("cleared done tasks")
+
+
+def cmd_list(b, a):
+    tasks = b.data["tasks"]
+    if a.status:
+        tasks = [t for t in tasks if t["status"] == a.status]
+    if a.repo:
+        tasks = [t for t in tasks if t["repo"] == a.repo]
+    if a.json:
+        print(json.dumps(tasks, indent=2)); return
+    if not tasks:
+        print("(no tasks)"); return
+    for t in tasks:
+        mark = {"open": "[ ]", "claimed": "[~]", "done": "[x]"}.get(t["status"], "[?]")
+        who = t["claimed_by"] or t["session"] or "-"
+        print("%s %s  %-9s %-14s %s" % (mark, t["id"], t["status"], who, t["text"]))
+
+
+def cmd_get(b, a):
+    t = b.find(a.id)
+    if not t:
+        print("no such task: %s" % a.id, file=sys.stderr); sys.exit(1)
+    print(json.dumps(t, indent=2) if a.json else t["text"])
+
+
+def main():
+    p = argparse.ArgumentParser(prog="fleet-task")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("add"); s.add_argument("text")
+    s.add_argument("--repo"); s.add_argument("--session"); s.add_argument("--created-by", dest="created_by")
+    s.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("list"); s.add_argument("--json", action="store_true")
+    s.add_argument("--status"); s.add_argument("--repo"); s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("get"); s.add_argument("id"); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_get)
+
+    s = sub.add_parser("claim"); s.add_argument("id"); s.add_argument("--session", required=True)
+    s.set_defaults(fn=cmd_claim)
+
+    s = sub.add_parser("complete"); s.add_argument("id"); s.set_defaults(fn=cmd_complete)
+    s = sub.add_parser("remove"); s.add_argument("id"); s.set_defaults(fn=cmd_remove)
+
+    s = sub.add_parser("clear"); s.add_argument("--all", action="store_true")
+    s.add_argument("--done", action="store_true"); s.set_defaults(fn=cmd_clear)
+
+    a = p.parse_args()
+    b = Board()
+    try:
+        a.fn(b, a)
+    finally:
+        b.save()
+
+
+if __name__ == "__main__":
+    main()

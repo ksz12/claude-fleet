@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# fleet-up — start the fleet CONTROL tmux session with two panes:
+#   top:    claude-dashboard (live view)
+#   bottom: fleet-watchdog   (liveness/escalation)
+# Attach with:  tmux attach -t fleet
+set -u
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SESSION="${FLEET_CONTROL_SESSION:-fleet}"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "fleet control already running -> tmux attach -t $SESSION"
+  exit 0
+fi
+
+tmux new-session -d -s "$SESSION" -n control "$DIR/claude-dashboard"
+tmux split-window -v -t "$SESSION" "$DIR/fleet-watchdog"
+tmux select-layout -t "$SESSION" main-horizontal 2>/dev/null
+echo "fleet control up -> tmux attach -t $SESSION  (dashboard + watchdog)"

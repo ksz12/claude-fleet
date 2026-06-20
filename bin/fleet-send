@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# fleet-send <session-name> <message...>
+#
+# Inter-session communication. Appends the message to the target session's
+# per-repo mailbox, and (if the target is idle) relays it straight into the
+# session's tmux prompt via load-buffer/paste-buffer.
+#
+# Relaying only when idle avoids interrupting a session mid-work; a busy
+# target still gets the mailbox entry.
+
+set -u
+DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$DIR/fleet-lib.sh"
+
+TARGET="${1:-}"; shift || true
+MSG="$*"
+[ -z "$TARGET" ] && { echo "usage: fleet-send <session> <message>" >&2; exit 1; }
+[ -z "$MSG" ] && { echo "fleet-send: empty message" >&2; exit 1; }
+
+STATE="$SESS_DIR/$TARGET.json"
+[ -f "$STATE" ] || { echo "fleet-send: no such session: $TARGET" >&2; exit 1; }
+
+STATUS="$(jq -r '.status // ""' "$STATE")"
+REPO="$(jq -r '.working_directory // ""' "$STATE")"
+REPO_ROOT="$(jq -r '.repo_root // ""' "$STATE")"
+FROM="${FLEET_SESSION_NAME:-${USER:-someone}}"
+NOW="$(fleet_now)"
+
+# 1) durable mailbox (per repo)
+if [ -n "$REPO_ROOT" ]; then
+  MBOX_DIR="$REPO_ROOT/.fleet"
+else
+  MBOX_DIR="$REPO/.fleet"
+fi
+mkdir -p "$MBOX_DIR" 2>/dev/null
+MBOX="$MBOX_DIR/mailbox.jsonl"
+jq -nc --arg from "$FROM" --arg to "$TARGET" --arg ts "$NOW" --arg msg "$MSG" \
+  '{ts:$ts,from:$from,to:$to,msg:$msg}' >> "$MBOX"
+
+# 2) live relay only when target is idle
+if [ "$STATUS" = "idle" ]; then
+  if tmux has-session -t "$TARGET" 2>/dev/null; then
+    buf="fleetmsg-$TARGET-$$"
+    printf '[fleet message from %s] %s' "$FROM" "$MSG" | tmux load-buffer -b "$buf" -
+    sleep 1
+    tmux paste-buffer -p -b "$buf" -t "$TARGET"
+    sleep 1
+    tmux send-keys -t "$TARGET" Enter
+    tmux delete-buffer -b "$buf" 2>/dev/null
+    echo "relayed live to $TARGET (was idle) + mailbox"
+  else
+    echo "queued to mailbox ($TARGET idle but no tmux session found)"
+  fi
+else
+  echo "queued to mailbox ($TARGET is '$STATUS'; will not interrupt)"
+fi

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""fleet-watchdog — liveness supervisor for the fleet.
+
+Every INTERVAL seconds, for each session in ~/.claude/fleet/sessions/:
+  * DEAD   : tmux session is gone but state isn't 'ended' -> mark crashed,
+             archive it, alert.
+  * STUCK  : status is 'working' but latest_activity is older than
+             STUCK_THRESHOLD -> mark stuck, alert (once).
+
+Recovery policy: ESCALATE, never auto-kill. Interactive sessions hold context
+we must not destroy; the watchdog surfaces problems (alerts.log + optional
+macOS notification) and leaves recovery (attach / `claude --resume`) to you.
+
+Env: FLEET_STUCK_SECONDS (default 600), FLEET_WATCH_INTERVAL (default 5),
+     FLEET_NOTIFY=0 to disable macOS notifications.
+"""
+import json, os, glob, time, subprocess
+from datetime import datetime, timezone
+
+FLEET_DIR = os.environ.get("FLEET_DIR", os.path.expanduser("~/.claude/fleet"))
+SESS = os.path.join(FLEET_DIR, "sessions")
+ARCH = os.path.join(FLEET_DIR, "archive")
+ALERTS = os.path.join(FLEET_DIR, "alerts.log")
+
+STUCK = int(os.environ.get("FLEET_STUCK_SECONDS", "600"))
+INTERVAL = int(os.environ.get("FLEET_WATCH_INTERVAL", "5"))
+NOTIFY = os.environ.get("FLEET_NOTIFY", "1") != "0"
+
+_alerted = set()  # (name, kind) we've already alerted on
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def parse_iso(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def tmux_alive(name):
+    return subprocess.call(
+        ["tmux", "has-session", "-t", name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+def alert(name, kind, msg):
+    key = (name, kind)
+    if key in _alerted:
+        return
+    _alerted.add(key)
+    line = "%s  [%s]  %s — %s\n" % (
+        now().strftime("%Y-%m-%dT%H:%M:%SZ"), kind.upper(), name, msg)
+    with open(ALERTS, "a") as f:
+        f.write(line)
+    print(line, end="")
+    if NOTIFY:
+        try:
+            subprocess.call(["osascript", "-e",
+                'display notification "%s" with title "Fleet: %s %s"'
+                % (msg.replace('"', "'"), kind, name)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def write_state(path, st):
+    tmp = path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=2)
+    os.replace(tmp, path)
+
+
+def sweep():
+    for p in glob.glob(os.path.join(SESS, "*.json")):
+        try:
+            with open(p) as f:
+                st = json.load(f)
+        except Exception:
+            continue
+        name = st.get("name") or os.path.basename(p)[:-5]
+        status = st.get("status", "")
+        tmux_name = st.get("tmux_session") or name
+
+        # DEAD: tmux pane gone. (Skip the lead/ad-hoc sessions that never had a
+        # tmux session of their own — those have no tmux_session match running,
+        # so only treat as dead if we believe it was a fleet-launched tmux job.)
+        if status not in ("ended", "crashed") and st.get("tmux_session"):
+            if not tmux_alive(tmux_name):
+                st["status"] = "crashed"
+                write_state(p, st)
+                os.replace(p, os.path.join(ARCH, os.path.basename(p)))
+                alert(name, "crashed", "tmux session gone; archived")
+                continue
+
+        # STUCK: working but no activity for a while
+        if status == "working":
+            last = parse_iso(st.get("latest_activity"))
+            if last and (now() - last).total_seconds() > STUCK:
+                st["status"] = "stuck"
+                write_state(p, st)
+                mins = int((now() - last).total_seconds() / 60)
+                alert(name, "stuck", "no activity for %dm while working" % mins)
+        else:
+            _alerted.discard((name, "stuck"))  # reset so it can re-alert later
+
+
+def main():
+    print("fleet-watchdog: interval=%ds stuck=%ds notify=%s" % (INTERVAL, STUCK, NOTIFY))
+    while True:
+        try:
+            sweep()
+        except Exception as e:
+            print("watchdog error: %s" % e)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
