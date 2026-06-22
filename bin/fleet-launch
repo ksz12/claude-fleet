@@ -63,9 +63,14 @@ tmux new-session -d -s "$NAME" -c "$REPO"
 # ALWAYS cd to the repo, then launch claude interactively with name injection
 tmux send-keys -t "$NAME" "cd $(printf '%q' "$REPO") && FLEET_SESSION_NAME=$(printf '%q' "$NAME") $CLAUDE_BIN --dangerously-skip-permissions" Enter
 
-# --- wait for the input prompt; auto-accept the first-run folder-trust prompt ---
-# (--dangerously-skip-permissions does NOT bypass the "trust this folder" dialog;
-#  new repos always hit it. We accept it since the harness created the dir.)
+# --- wait for a TRULY-ready bypass prompt before pasting -----------------------
+# Choke we're guarding against: on a brand-new repo dir the "trust this folder"
+# dialog renders first. The old code treated "? for shortcuts" as ready and
+# pasted DURING that transition — the paste got swallowed AND the session settled
+# outside bypass mode. Fix: auto-accept the trust dialog, then require the actual
+# "bypass permissions on" footer (we ALWAYS launch with the flag) before pasting.
+# "? for shortcuts" alone is NOT sufficient — it shows pre-bypass and racing it
+# is exactly what broke.
 ready=0
 i=0
 trusted=0
@@ -79,24 +84,51 @@ while [ $i -lt 120 ]; do
       fi
       i=$((i+1)); sleep 1; continue ;;
   esac
-  # the real input prompt is up once the bypass-mode footer / welcome box renders
   case "$pane" in
-    *"bypass permissions on"*|*"? for shortcuts"*|*"Welcome back"*) ready=1; break ;;
+    *"bypass permissions on"*) ready=1; break ;;   # primary: real bypass footer
+    *"Welcome back"*)          ready=1; break ;;   # resumed dir (still bypass)
   esac
   i=$((i+1)); sleep 1
 done
 
-# brief extra settle so the prompt box is fully interactive before we paste
-if [ "$ready" -eq 1 ]; then sleep 2; fi
+# settle so the input box is fully interactive before we touch it
+[ "$ready" -eq 1 ] && sleep 2
 
-# --- send the (multi-line) prompt: load-buffer + paste-buffer, NEVER send-keys ---
+# --- paste the prompt, then VERIFY it landed before submitting ------------------
+# load-buffer + paste-buffer (bracketed), NEVER send-keys for the multi-line body.
+# Confirm a stable needle from the prompt actually appears in the pane and retry
+# the paste up to 3x, so a swallowed paste no longer silently no-ops.
+needle="$(grep -m1 -v '^[[:space:]]*$' "$PROMPT_FILE" | cut -c1-40)"
 buf="fleet-$NAME"
-tmux load-buffer -b "$buf" "$PROMPT_FILE"
-sleep 1
-tmux paste-buffer -p -b "$buf" -t "$NAME"
-sleep 1
-tmux send-keys -t "$NAME" Enter
+pasted=0
+attempt=0
+while [ $attempt -lt 3 ]; do
+  tmux send-keys -t "$NAME" C-u            # clear any stray chars on the line
+  sleep 0.4
+  tmux load-buffer -b "$buf" "$PROMPT_FILE"
+  sleep 0.5
+  tmux paste-buffer -p -b "$buf" -t "$NAME"
+  sleep 1.5
+  pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
+  if [ -n "$needle" ] && printf '%s' "$pane" | grep -qF -- "$needle"; then
+    pasted=1; break
+  fi
+  attempt=$((attempt+1))
+done
 tmux delete-buffer -b "$buf" 2>/dev/null
+
+# --- submit, then VERIFY acceptance (footer flips to "esc to interrupt") --------
+submitted=0
+if [ "$pasted" -eq 1 ]; then
+  s=0
+  while [ $s -lt 3 ]; do
+    tmux send-keys -t "$NAME" Enter
+    sleep 2
+    pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
+    case "$pane" in *"esc to interrupt"*) submitted=1; break ;; esac
+    s=$((s+1))
+  done
+fi
 
 # --- pop the session into its own Terminal.app window (alt-tab target) ---
 # Always-on for interactive launches. Disable with FLEET_NO_WINDOW=1 (set in
@@ -111,8 +143,10 @@ OSA
   echo "opened a new Terminal window attached to $NAME"
 fi
 
-if [ "$ready" -eq 1 ]; then
-  echo "launched: $NAME  ->  tmux attach -t $NAME   (prompt sent)"
+if [ "$submitted" -eq 1 ]; then
+  echo "launched: $NAME  ->  tmux attach -t $NAME   (prompt sent & confirmed processing)"
+elif [ "$pasted" -eq 1 ]; then
+  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: prompt pasted but submission unconfirmed — check the pane)"
 else
-  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: readiness not confirmed; verify the prompt landed)"
+  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: prompt did NOT land — check the pane and re-send)"
 fi
