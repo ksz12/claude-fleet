@@ -62,6 +62,63 @@ SessionEnd. See [PLAN.md](PLAN.md) for the full design rationale.
 `install.sh` is idempotent and adds its hooks *alongside* any existing ones
 (it never overwrites your hook config).
 
+## Examples — the workflow
+
+### Launch work into a tracked session
+```
+/background add rate limiting to the API gateway, with tests
+```
+`/background` expands the terse prompt into a self-contained brief (goal,
+deliverables, edge cases, definition of done), names + scaffolds a repo, and
+launches an interactive session in its own tmux window. With flags:
+
+```
+/background --repo billing --task t-007 fix the refund webhook double-fire
+/background --yolo spike a websocket reconnect strategy        # skip the confirm step
+```
+
+### Coordinate across sessions with the taskboard
+```
+/taskboard add "migrate auth to JWT"        # -> t-001
+/taskboard                                   # list open + claimed tasks
+```
+Or the CLI any session can script:
+```sh
+fleet-task add "backfill orders table"       # -> t-002
+fleet-task claim t-002 --session orders-backfill
+fleet-task complete t-002
+```
+
+### Message a peer session (mailbox)
+```sh
+fleet-send orders-backfill "schema is in db/schema.sql; don't touch migrations/"
+```
+
+### Watch everything at once
+```sh
+claude-dashboard          # live, read-only status of every session
+                          # (or tile it with sessions — see "Mission control" below)
+```
+
+### Wrap up cleanly
+```
+/conclude
+```
+Runs a critical retrospective (token burn, re-prompting, repeated mistakes),
+offers to capture durable lessons (into [grimoire](https://github.com/ksz12/grimoire)
+if installed, else `CLAUDE.md`), then tears down — archives the session JSON,
+removes the worktree, kills the tmux session.
+
+### End-to-end, in one breath
+```
+/background build a CSV import endpoint with validation + tests   # spawns "csv-import"
+#   …attach, steer, let it run…
+fleet-send csv-import "reuse the validators in lib/validate.ts"
+/taskboard add "load-test the import path"                        # queue a follow-up
+claude-dashboard                                                  # watch progress
+/conclude                                                         # retro + teardown
+```
+
 ## Using it day-to-day
 
 Each `/background` launch is its **own** tmux session named after the job, so the
