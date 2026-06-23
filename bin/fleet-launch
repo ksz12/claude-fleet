@@ -94,32 +94,40 @@ done
 # settle so the input box is fully interactive before we touch it
 [ "$ready" -eq 1 ] && sleep 2
 
-# --- paste the prompt, submit, and VERIFY submission ----------------------------
-# load-buffer + paste-buffer (bracketed), NEVER send-keys for the multi-line body.
-# Do NOT grep the prompt back out of the pane to confirm the paste: a long prompt
-# scrolls its first lines out of the visible capture, which falsely reads as "not
-# landed" and (previously) skipped the Enter — leaving the user to press it.
-# Instead, paste -> Enter -> confirm the footer flips to "esc to interrupt" (i.e.
-# it's actually processing). Retry the whole paste+Enter up to 3x. A guard at the
-# top of the loop avoids a double-submit if a prior attempt was just slow to show.
+# --- paste the prompt ONCE, then confirm submission via a reliable signal --------
+# Two failure modes we avoid:
+#   1. Grepping the prompt back out of the pane to confirm the paste — a long prompt
+#      scrolls its first lines out of the visible capture, which falsely reads as
+#      "not landed" (and previously skipped the Enter, forcing a manual keypress).
+#   2. Rapidly re-pasting to "make sure" — re-pasting while the first submit is
+#      still starting QUEUES DUPLICATE messages.
+# Instead: paste + Enter ONCE, then POLL. The UserPromptSubmit hook flips this
+# session's JSON status to "working" the instant the prompt is accepted (and the
+# footer shows "esc to interrupt"). Only if a full poll window passes do we retry ONCE.
 buf="fleet-$NAME"
-submitted=0
-attempt=0
-while [ $attempt -lt 3 ]; do
-  pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
-  case "$pane" in *"esc to interrupt"*) submitted=1; break ;; esac  # already processing
-  tmux send-keys -t "$NAME" C-u            # clear any stray chars on the line
-  sleep 0.4
-  tmux load-buffer -b "$buf" "$PROMPT_FILE"
-  sleep 0.5
-  tmux paste-buffer -p -b "$buf" -t "$NAME"
-  sleep 1.5
+
+_submit_once() {
+  tmux send-keys -t "$NAME" C-u; sleep 0.4          # clear any stray chars
+  tmux load-buffer -b "$buf" "$PROMPT_FILE"; sleep 0.5
+  tmux paste-buffer -p -b "$buf" -t "$NAME"; sleep 1.2
   tmux send-keys -t "$NAME" Enter
-  sleep 2.5
-  pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
-  case "$pane" in *"esc to interrupt"*) submitted=1; break ;; esac
-  attempt=$((attempt+1))
-done
+}
+_confirm_submit() {                                  # poll up to $1s; sets `submitted`
+  local n="$1" j=0 st
+  while [ $j -lt "$n" ]; do
+    st="$(jq -r '.status // ""' "$f" 2>/dev/null)"
+    [ "$st" = "working" ] && { submitted=1; return; }
+    case "$(tmux capture-pane -t "$NAME" -p 2>/dev/null)" in
+      *"esc to interrupt"*) submitted=1; return ;;
+    esac
+    j=$((j+1)); sleep 1
+  done
+}
+
+submitted=0
+_submit_once
+_confirm_submit 25
+if [ "$submitted" -eq 0 ]; then _submit_once; _confirm_submit 15; fi
 tmux delete-buffer -b "$buf" 2>/dev/null
 
 # --- pop the session into its own Terminal.app window (alt-tab target) ---
