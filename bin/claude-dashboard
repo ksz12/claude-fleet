@@ -21,8 +21,11 @@ C = {"reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
      "cyan": "\033[36m", "blue": "\033[34m", "mag": "\033[35m"}
 
 STATUS_COLOR = {"working": "green", "active": "cyan", "starting": "blue",
-                "idle": "yellow", "stuck": "red", "crashed": "red",
+                "idle": "yellow", "asking": "mag", "stuck": "red", "crashed": "red",
                 "ended": "dim"}
+
+# statuses that mean "the session is blocked on YOU"
+WAITING_STATUSES = ("idle", "asking")
 
 
 def parse_iso(s):
@@ -106,17 +109,18 @@ def render():
                 col(s.get("dir_label") or os.path.basename(s.get("working_directory", "") or "-"), "dim"),
             ))
 
-    # WAITING (idle = finished responding, awaiting input)
-    waiting = [s for s in sessions if s.get("status") == "idle"]
+    # WAITING (idle = finished a turn; asking = blocked on a question/plan approval)
+    waiting = [s for s in sessions if s.get("status") in WAITING_STATUSES]
     lines.append("")
     lines.append(col("WAITING ON YOU", "bold"))
     if not waiting:
         lines.append(col("  (none)", "dim"))
     else:
         for s in waiting:
+            st = s.get("status", "idle")
             lines.append("  %s %s %s" % (
                 col("%-22s" % s.get("name", "?")[:22], "yellow"),
-                col("%-9s" % "idle", STATUS_COLOR.get("idle", "yellow")),
+                col("%-9s" % st, STATUS_COLOR.get(st, "yellow")),
                 col("%s ago" % ago(s.get("latest_activity")), "dim"),
             ))
 

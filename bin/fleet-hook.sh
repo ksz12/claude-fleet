@@ -19,6 +19,7 @@ getf() { printf '%s' "$input" | jq -r "$1 // empty" 2>/dev/null; }
 sid="$(getf '.session_id')"
 cwd="$(getf '.cwd')"
 tpath="$(getf '.transcript_path')"
+tool="$(getf '.tool_name')"
 
 # --- correlation: FLEET_SESSION_NAME (primary) -> index.json by cwd -> basename
 name="${FLEET_SESSION_NAME:-}"
@@ -37,7 +38,14 @@ now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 case "$EVENT" in
   SessionStart)               status="active"  ;;
   UserPromptSubmit)           status="working" ;;
-  PreToolUse|PostToolUse)     status="working" ;;
+  PreToolUse)
+    # Blocking, user-input tools sit mid-tool-call with NO Stop event, so they'd
+    # otherwise read as "working" forever while really awaiting the user. Flag them.
+    case "$tool" in
+      AskUserQuestion|ExitPlanMode) status="asking"  ;;
+      *)                            status="working" ;;
+    esac ;;
+  PostToolUse)                status="working" ;;   # user answered -> back to work
   Stop)                       status="idle"    ;;
   SessionEnd)                 status="ended"   ;;
   *)                          status=""        ;;
