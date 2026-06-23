@@ -94,41 +94,33 @@ done
 # settle so the input box is fully interactive before we touch it
 [ "$ready" -eq 1 ] && sleep 2
 
-# --- paste the prompt, then VERIFY it landed before submitting ------------------
+# --- paste the prompt, submit, and VERIFY submission ----------------------------
 # load-buffer + paste-buffer (bracketed), NEVER send-keys for the multi-line body.
-# Confirm a stable needle from the prompt actually appears in the pane and retry
-# the paste up to 3x, so a swallowed paste no longer silently no-ops.
-needle="$(grep -m1 -v '^[[:space:]]*$' "$PROMPT_FILE" | cut -c1-40)"
+# Do NOT grep the prompt back out of the pane to confirm the paste: a long prompt
+# scrolls its first lines out of the visible capture, which falsely reads as "not
+# landed" and (previously) skipped the Enter — leaving the user to press it.
+# Instead, paste -> Enter -> confirm the footer flips to "esc to interrupt" (i.e.
+# it's actually processing). Retry the whole paste+Enter up to 3x. A guard at the
+# top of the loop avoids a double-submit if a prior attempt was just slow to show.
 buf="fleet-$NAME"
-pasted=0
+submitted=0
 attempt=0
 while [ $attempt -lt 3 ]; do
+  pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
+  case "$pane" in *"esc to interrupt"*) submitted=1; break ;; esac  # already processing
   tmux send-keys -t "$NAME" C-u            # clear any stray chars on the line
   sleep 0.4
   tmux load-buffer -b "$buf" "$PROMPT_FILE"
   sleep 0.5
   tmux paste-buffer -p -b "$buf" -t "$NAME"
   sleep 1.5
+  tmux send-keys -t "$NAME" Enter
+  sleep 2.5
   pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
-  if [ -n "$needle" ] && printf '%s' "$pane" | grep -qF -- "$needle"; then
-    pasted=1; break
-  fi
+  case "$pane" in *"esc to interrupt"*) submitted=1; break ;; esac
   attempt=$((attempt+1))
 done
 tmux delete-buffer -b "$buf" 2>/dev/null
-
-# --- submit, then VERIFY acceptance (footer flips to "esc to interrupt") --------
-submitted=0
-if [ "$pasted" -eq 1 ]; then
-  s=0
-  while [ $s -lt 3 ]; do
-    tmux send-keys -t "$NAME" Enter
-    sleep 2
-    pane="$(tmux capture-pane -t "$NAME" -p 2>/dev/null)"
-    case "$pane" in *"esc to interrupt"*) submitted=1; break ;; esac
-    s=$((s+1))
-  done
-fi
 
 # --- pop the session into its own Terminal.app window (alt-tab target) ---
 # Always-on for interactive launches. Disable with FLEET_NO_WINDOW=1 (set in
@@ -145,8 +137,6 @@ fi
 
 if [ "$submitted" -eq 1 ]; then
   echo "launched: $NAME  ->  tmux attach -t $NAME   (prompt sent & confirmed processing)"
-elif [ "$pasted" -eq 1 ]; then
-  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: prompt pasted but submission unconfirmed — check the pane)"
 else
-  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: prompt did NOT land — check the pane and re-send)"
+  echo "launched: $NAME  ->  tmux attach -t $NAME   (WARNING: submission unconfirmed — check the pane; you may need to press Enter)"
 fi

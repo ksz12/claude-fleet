@@ -62,6 +62,55 @@ SessionEnd. See [PLAN.md](PLAN.md) for the full design rationale.
 `install.sh` is idempotent and adds its hooks *alongside* any existing ones
 (it never overwrites your hook config).
 
+## Using it day-to-day
+
+Each `/background` launch is its **own** tmux session named after the job, so the
+sessions sit alongside your `main` session as siblings — attach to whichever you
+want; they keep running after you detach.
+
+### Attach, detach, switch
+
+```sh
+tmux ls                          # list every session
+tmux attach -t blinds-store      # attach to one
+#   Ctrl-b d   detach (it keeps running)
+#   Ctrl-b s   interactive session switcher
+#   Ctrl-b ( ) previous / next session
+```
+
+### One OS window per session (what the launcher does on macOS)
+
+`fleet-launch` auto-opens a Terminal window attached to each new session
+(set `FLEET_NO_WINDOW=1` to skip). Re-open one manually any time:
+
+```sh
+osascript -e 'tell application "Terminal" to do script "tmux attach -t blinds-store"'
+```
+
+### "Mission control" — dashboard + sessions in split panes
+
+Tile the live dashboard and a couple of running sessions in a single window:
+
+```sh
+tmux new-session -d -s fleetview -n control 'claude-dashboard'
+tmux split-window  -h -t fleetview 'tmux attach -t blinds-store'
+tmux split-window  -v -t fleetview 'tmux attach -t discord-traitors'
+tmux select-layout -t fleetview tiled
+tmux attach        -t fleetview
+```
+
+Attaching a session *inside a pane* shares that session's view (tmux clamps it to
+the smallest attached client). For independent sizing, prefer one OS window per
+session (above) and keep the split-pane window just for the read-only dashboard.
+
+### Pane keys (default prefix `Ctrl-b`)
+
+```
+Ctrl-b "      split top / bottom        Ctrl-b z      zoom / unzoom a pane
+Ctrl-b %      split left / right        Ctrl-b ←↑↓→   move between panes
+Ctrl-b x      kill the pane             Ctrl-b d      detach (session keeps running)
+```
+
 ## Layout
 
 ```
